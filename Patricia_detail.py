@@ -5,7 +5,6 @@ import os
 import time
 import requests
 from functools import wraps
-from typing import Dict, List, Tuple
 
 # === 參數設定 ===
 stockfish_path   = r'D:\python\my chess game code\stockfish\stockfish-windows-x86-64-avx2.exe'
@@ -20,10 +19,7 @@ multipv_variation        = 1
 advantage_threshold_base    = 150
 candidate_move_tolerance    = 20
 move_selection_iterations   = 0
-branching_probability_threshold = 0.0
-LICHESS_GAME_THRESHOLD = 1000
-
-position_cache: Dict[str, List[chess.Move]] = {}
+branching_probability_threshold = 0.10
 
 # === 工具函式 ===
 def measure_time(func):
@@ -119,7 +115,7 @@ def end_variation_if_our_turn(board, node, pov_white, sf, maia, pat):
             board.pop()
 
 @measure_time
-def generate_variation(board, node, ply, max_ply, pov_white, sf, maia, pat, base_score):
+def generate_variation(board, node, ply, max_ply, pov_white, sf, maia, pat, base_score, allow_branch):
     if board.is_game_over(): return
     if ply>=max_ply or has_clear_advantage(sf,board,pov_white,base_score):
         end_variation_if_our_turn(board,node,pov_white,sf,maia,pat)
@@ -130,7 +126,7 @@ def generate_variation(board, node, ply, max_ply, pov_white, sf, maia, pat, base
         if mv:
             board.push(mv)
             nxt = node.add_main_variation(mv)
-            generate_variation(board,nxt,ply+1,max_ply,pov_white,sf,maia,pat,base_score)
+            generate_variation(board,nxt,ply+1,max_ply,pov_white,sf,maia,pat,base_score,allow_branch)
             board.pop()
     else:
         # 對手用 Stockfish + Lichess Explorer 分支
@@ -139,28 +135,15 @@ def generate_variation(board, node, ply, max_ply, pov_white, sf, maia, pat, base
         if engine_mv and engine_mv in board.legal_moves:
             board.push(engine_mv)
             var = node.add_main_variation(engine_mv)
-            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,base_score)
+            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,base_score,False)
             board.pop()
-
-        fen = board.fen()
-        cache_moves = position_cache.get(fen)
-        if cache_moves is None:
-            moves_list, total_games = moves_data
-            cache_moves = []
-            if moves_list and total_games >= LICHESS_GAME_THRESHOLD:
-                for md in moves_list:
-                    try:
-                        mv = chess.Move.from_uci(md['uci'])
-                    except ValueError:
-                        continue
-                    if mv in board.legal_moves and mv != engine_mv:
-                        cache_moves.append(mv)
-            position_cache[fen] = sorted(cache_moves, key=lambda m: m.uci())
-
-        for mv in position_cache[fen]:
+        for md in moves_data:
+            if md['probability']<branching_probability_threshold: continue
+            mv = chess.Move.from_uci(md['uci'])
+            if mv not in board.legal_moves or mv==engine_mv: continue
             board.push(mv)
             var = node.add_variation(mv)
-            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,base_score)
+            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,base_score,False)
             board.pop()
 
 @measure_time
@@ -186,28 +169,16 @@ def generate_opening_preparation(board, node, ply, max_ply, pov_white, sf, maia,
             nxt = node.add_main_variation(engine_mv)
             generate_opening_preparation(board,nxt,ply+1,max_ply,pov_white,sf,maia,pat,init_score)
             board.pop()
-        fen = board.fen()
-        cache_moves = position_cache.get(fen)
-        if cache_moves is None:
-            moves_list, total_games = moves_data
-            cache_moves = []
-            if moves_list and total_games >= LICHESS_GAME_THRESHOLD:
-                for md in moves_list:
-                    try:
-                        mv = chess.Move.from_uci(md['uci'])
-                    except ValueError:
-                        continue
-                    if mv in board.legal_moves and mv != engine_mv:
-                        cache_moves.append(mv)
-            position_cache[fen] = sorted(cache_moves, key=lambda m: m.uci())
-
-        for mv in position_cache[fen]:
+        for md in moves_data:
+            if md['probability']<branching_probability_threshold: continue
+            mv = chess.Move.from_uci(md['uci'])
+            if mv not in board.legal_moves or mv==engine_mv: continue
             board.push(mv)
             var = node.add_variation(mv)
-            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,score_here)
+            generate_variation(board,var,ply+1,max_ply,pov_white,sf,maia,pat,score_here,False)
             board.pop()
 
-def get_lichess_top_moves(fen: str, num: int = 10) -> Tuple[List[Dict], int]:
+def get_lichess_top_moves(fen, num=10):
     params = {
         'fen':fen, 'variant':'standard',
         'speeds':'blitz,rapid,classical',
@@ -223,7 +194,7 @@ def get_lichess_top_moves(fen: str, num: int = 10) -> Tuple[List[Dict], int]:
     for m in moves:
         games = m.get('white',0)+m.get('draws',0)+m.get('black',0)
         m['probability'] = games/total if total else 0
-    return sorted(moves, key=lambda x:x['probability'], reverse=True)[:num], total
+    return sorted(moves, key=lambda x:x['probability'], reverse=True)[:num]
 
 # === 主程式入口 ===
 if __name__ == "__main__":
