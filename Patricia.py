@@ -6,7 +6,7 @@ import time
 import requests
 import statistics  # 引入 statistics 模組
 from functools import wraps
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 from maia2 import model, inference
 
 # === 參數設定 ===
@@ -25,11 +25,6 @@ ABSOLUTE_MAX_PLY = 40               # 安全閥，不論局面多複雜，總回
 # 其他參數
 advantage_threshold_base = 150  # 局面優勢超過這個值(centipawns)就停止延伸
 branching_probability_threshold = 0.1  # Lichess 資料庫和 Maia2 中，著法出現機率低於此值則不考慮
-# 若 Lichess 總對局數低於此閾值，改用 Maia2 推論
-LICHESS_GAME_THRESHOLD = 1000
-
-# 用於快取每個局面的候選走法，確保重複局面產生一致結果
-position_cache: Dict[str, List[chess.Move]] = {}
 
 # === 工具函式 ===
 def measure_time(func):
@@ -141,7 +136,7 @@ def select_best_move_for_us(pat_engine: chess.engine.SimpleEngine, board: chess.
         print(f"警告: Patricia 引擎在局面 {board.fen()} 中出錯: {e}")
         return None
 
-def get_lichess_top_moves(fen: str, num: int = 10) -> Tuple[List[Dict], int]:
+def get_lichess_top_moves(fen: str, num: int = 10) -> List[Dict]:
     params = {'fen': fen, 'variant': 'standard', 'speeds': 'blitz,rapid,classical', 'ratings': '2000,2200,2500'}
     try:
         r = requests.get('https://explorer.lichess.ovh/lichess', params=params, timeout=5)
@@ -149,15 +144,13 @@ def get_lichess_top_moves(fen: str, num: int = 10) -> Tuple[List[Dict], int]:
         data = r.json()
         total_games = data.get('white', 0) + data.get('draws', 0) + data.get('black', 0)
         moves_data = data.get('moves', [])
-        if not moves_data or total_games == 0:
-            return [], total_games
+        if not moves_data or total_games == 0: return []
         for m in moves_data:
             m['probability'] = (m.get('white', 0) + m.get('draws', 0) + m.get('black', 0)) / total_games
-        sorted_moves = sorted(moves_data, key=lambda x: x['probability'], reverse=True)[:num]
-        return sorted_moves, total_games
+        return sorted(moves_data, key=lambda x: x['probability'], reverse=True)[:num]
     except (requests.exceptions.RequestException, ValueError) as e:
         print(f"警告: Lichess API 獲取失敗: {e}")
-        return [], 0
+        return []
 
 def get_maia2_candidate_moves(
     board: chess.Board, 
@@ -216,27 +209,24 @@ def get_opponent_candidate_moves(
         return [sf_best_move]
 
     # 優先嘗試從 Lichess 獲取著法
-    fen = board.fen()
-    if fen in position_cache:
-        return position_cache[fen]
-
-    lichess_moves, total_games = get_lichess_top_moves(fen)
-    if lichess_moves and total_games >= LICHESS_GAME_THRESHOLD:
+    lichess_moves = get_lichess_top_moves(board.fen())
+    if lichess_moves:
         for move_data in lichess_moves:
-            try:
-                candidate_moves.add(chess.Move.from_uci(move_data['uci']))
-            except ValueError:
-                continue
+            if move_data['probability'] > branching_probability_threshold:
+                try: 
+                    candidate_moves.add(chess.Move.from_uci(move_data['uci']))
+                except ValueError: 
+                    continue
     else:
-        # Lichess 資料不足時，使用 Maia2 作為備選
+        # Lichess 無資料時，使用 Maia2 作為備選
         maia2_moves = get_maia2_candidate_moves(board, maia2_model, prepared_inference, opponent_elo)
         for move in maia2_moves:
             candidate_moves.add(move)
 
-    final_list = [m for m in candidate_moves if m != sf_best_move]
-    final_list = sorted(final_list, key=lambda m: m.uci())
+    final_list = list(candidate_moves)
+    if sf_best_move in final_list:
+        final_list.remove(sf_best_move)
     final_list.insert(0, sf_best_move)
-    position_cache[fen] = final_list
     return final_list
 
 def end_variation_if_our_turn(board, node, pov_white, pat_engine):
